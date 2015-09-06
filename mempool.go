@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/btcsuite/btcd/blockchain"
+	database "github.com/btcsuite/btcd/database2"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcutil"
@@ -39,6 +40,11 @@ const (
 	maxSigOpsPerTx = blockchain.MaxSigOpsPerBlock / 5
 )
 
+// TxStore houses transactions keyed by their hash.  It is primarily used to
+// return the results of fetching all transactions referenced by the inputs of
+// another transaction.
+type TxStore map[wire.ShaHash]*btcutil.Tx
+
 // mempoolTxDesc is a descriptor containing a transaction in the mempool along
 // with additional metadata.
 type mempoolTxDesc struct {
@@ -58,7 +64,7 @@ type mempoolConfig struct {
 	// EnableAddrIndex defines whether the address index should be enabled.
 	EnableAddrIndex bool
 
-	// FetchUtxoStore  defines the function to use to fetch unspent
+	// FetchUtxoStore defines the function to use to fetch unspent
 	// transacation output information.
 	FetchUtxoStore func(*btcutil.Tx) (blockchain.UtxoStore, error)
 
@@ -95,6 +101,7 @@ type mempoolConfig struct {
 type txMemPool struct {
 	sync.RWMutex
 	cfg           mempoolConfig
+	db            database.DB
 	pool          map[wire.ShaHash]*mempoolTxDesc
 	orphans       map[wire.ShaHash]*btcutil.Tx
 	orphansByPrev map[wire.ShaHash]map[wire.ShaHash]*btcutil.Tx
@@ -103,6 +110,20 @@ type txMemPool struct {
 	lastUpdated   time.Time // last time pool was updated
 	pennyTotal    float64   // exponentially decaying total for penny spends.
 	lastPennyUnix int64     // unix time of last ``penny spend''
+
+	// The following fields are used to quickly link transactions and
+	// addresses when an address index is being maintained.
+	//
+	// In particular, the addrIndex field is used to keep an index of all
+	// transactions which either create an output to a given address or
+	// spend from a previous output to it keyed by the address.
+	//
+	// The addrsByTx field is essentially the reverse and is used to keep an
+	// index of all addresses which a given transaction involves.  This
+	// allows fairly efficient updates to the address index when
+	// transactions are removed from the mempool.
+	addrIndex map[string]map[wire.ShaHash]struct{}
+	addrsByTx map[wire.ShaHash]map[string]struct{}
 }
 
 // Ensure the txMemPool type implements the mining.TxSource interface.
@@ -302,6 +323,26 @@ func (mp *txMemPool) HaveTransaction(hash *wire.ShaHash) bool {
 	return mp.haveTransaction(hash)
 }
 
+// removeTransactionFromAddrIndex removes the passed transaction from the
+// address index.  This function is only invoked when the optional address index
+// is activated.
+//
+// This function MUST be called with the mempool lock held (for writes).
+func (mp *txMemPool) removeTransactionFromAddrIndex(hash *wire.ShaHash) {
+	// Remove all address references to the transaction from the address
+	// index and remove the entry for the address altogether if it no longer
+	// references any transactions.
+	for addrStr := range mp.addrsByTx[*hash] {
+		delete(mp.addrIndex[addrStr], *hash)
+		if len(mp.addrIndex[addrStr]) == 0 {
+			delete(mp.addrIndex, addrStr)
+		}
+	}
+
+	// Remove the entry from the transaction to address lookup map as well.
+	delete(mp.addrsByTx, *hash)
+}
+
 // removeTransaction is the internal function which implements the public
 // RemoveTransaction.  See the comment for RemoveTransaction for more details.
 //
@@ -318,9 +359,15 @@ func (mp *txMemPool) removeTransaction(tx *btcutil.Tx, removeRedeemers bool) {
 		}
 	}
 
-	// Remove the transaction and mark the referenced outpoints as unspent
-	// by the pool.
+	// Remove the transaction if needed.
 	if txDesc, exists := mp.pool[*txHash]; exists {
+		// Remove the address index entries associated with the
+		// transaction if it is enabled.
+		if cfg.AddrIndex {
+			mp.removeTransactionFromAddrIndex(txHash)
+		}
+
+		// Mark the referenced outpoints as unspent by the pool.
 		for _, txIn := range txDesc.Tx.MsgTx().TxIn {
 			delete(mp.outpoints, txIn.PreviousOutPoint)
 		}
@@ -365,6 +412,60 @@ func (mp *txMemPool) RemoveDoubleSpends(tx *btcutil.Tx) {
 	}
 }
 
+// indexAddresses alters the address index by indexing the payment address(es)
+// encoded by the passed public key script.  This function is only invoked when
+// the optional address index is activated.
+//
+// This function MUST be called with the mempool lock held (for writes).
+func (mp *txMemPool) indexAddresses(pkScript []byte, tx *btcutil.Tx) {
+	// The error is ignored here since the only reason it can fail is if the
+	// script fails to parse and it was already validated before being
+	// admitted to the mempool.
+	_, addresses, _, _ := txscript.ExtractPkScriptAddrs(pkScript,
+		activeNetParams.Params)
+	for _, addr := range addresses {
+		// Add a mapping from the address to the transaction.
+		addrStr := addr.EncodeAddress()
+		addrIndexEntry := mp.addrIndex[addrStr]
+		if addrIndexEntry == nil {
+			addrIndexEntry = make(map[wire.ShaHash]struct{})
+			mp.addrIndex[addrStr] = addrIndexEntry
+		}
+		addrIndexEntry[*tx.Sha()] = struct{}{}
+
+		// Add a mapping from the transaction to the address.
+		addrsByTxEntry := mp.addrsByTx[*tx.Sha()]
+		if addrsByTxEntry == nil {
+			addrsByTxEntry = make(map[string]struct{})
+			mp.addrsByTx[*tx.Sha()] = addrsByTxEntry
+		}
+		addrsByTxEntry[addrStr] = struct{}{}
+	}
+}
+
+// addTransactionToAddrIndex adds all addresses related to the transaction to
+// the in-memory address index.  This function is only invoked when the optional
+// address index is activated.
+//
+// This function MUST be called with the mempool lock held (for writes).
+func (mp *txMemPool) addTransactionToAddrIndex(tx *btcutil.Tx, utxoStore blockchain.UtxoStore) {
+	// Index addresses of all referenced previous transaction outputs.
+	//
+	// The existence checks are elided since this is only called after the
+	// transaction has already been validated and thus all inputs are
+	// already known to exist.
+	for _, txIn := range tx.MsgTx().TxIn {
+		entry := utxoStore.LookupEntry(&txIn.PreviousOutPoint.Hash)
+		pkScript := entry.PkScriptByIndex(txIn.PreviousOutPoint.Index)
+		mp.indexAddresses(pkScript, tx)
+	}
+
+	// Index addresses of all created outputs.
+	for _, txOut := range tx.MsgTx().TxOut {
+		mp.indexAddresses(txOut.PkScript, tx)
+	}
+}
+
 // addTransaction adds the passed transaction to the memory pool.  It should
 // not be called directly as it doesn't perform any validation.  This is a
 // helper for maybeAcceptTransaction.
@@ -386,6 +487,12 @@ func (mp *txMemPool) addTransaction(utxoStore blockchain.UtxoStore, tx *btcutil.
 		mp.outpoints[txIn.PreviousOutPoint] = tx
 	}
 	mp.lastUpdated = time.Now()
+
+	// Add the addresses the transaction spends from and sends to into the
+	// address index if it is enabled.
+	if cfg.AddrIndex {
+		mp.addTransactionToAddrIndex(tx, utxoStore)
+	}
 }
 
 // checkPoolDoubleSpend checks whether or not the passed transaction is
@@ -433,6 +540,69 @@ func (mp *txMemPool) fetchInputUtxos(tx *btcutil.Tx) (blockchain.UtxoStore, erro
 	return utxoStore, nil
 }
 
+// FetchInputTransactions loads all input transactions referenced by the passed
+// transaction.  First, it attempts to load the transactions from the contents
+// of the transaction pool and then falls back to loading any remaining inputs
+// from the viewpoint of the main chain.  It requires the transaction index.
+//
+// This function is safe for concurrent access.
+func (mp *txMemPool) FetchInputTransactions(tx *btcutil.Tx) (TxStore, error) {
+	mp.RLock()
+	defer mp.RUnlock()
+
+	// Fetch any transactions that are in the transaction pool while keeping
+	// track of the ones that aren't so they can be fetched next.
+	txNeeded := make([]*wire.ShaHash, 0, len(tx.MsgTx().TxIn))
+	txStore := make(TxStore)
+	for _, txIn := range tx.MsgTx().TxIn {
+		originHash := txIn.PreviousOutPoint.Hash
+		if txDesc, ok := mp.pool[originHash]; ok {
+			txStore[originHash] = txDesc.Tx
+			continue
+		}
+
+		txNeeded = append(txNeeded, &originHash)
+	}
+
+	// Attempt to fetch any remaining transactions from the main chain
+	// database.
+	chain := mp.cfg.Chain
+	var serializedTxns [][]byte
+	err := mp.db.View(func(dbTx database.Tx) error {
+		// Look up the location of the transactions.
+		blockRegions := make([]database.BlockRegion, 0, len(txNeeded))
+		for _, originHash := range txNeeded {
+			region, err := chain.TxBlockRegion(dbTx, originHash)
+			if err != nil {
+				return err
+			}
+
+			if region != nil {
+				blockRegions = append(blockRegions, *region)
+			}
+		}
+
+		// Load the raw transaction bytes from the database.
+		var err error
+		serializedTxns, err = dbTx.FetchBlockRegions(blockRegions)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// Deserialize the transactions and add them to the store.
+	for _, serializedTx := range serializedTxns {
+		tx, err := btcutil.NewTxFromBytes(serializedTx)
+		if err != nil {
+			return nil, err
+		}
+		txStore[*tx.Sha()] = tx
+	}
+
+	return txStore, nil
+}
+
 // FetchTransaction returns the requested transaction from the transaction pool.
 // This only fetches from the main transaction pool and does not include
 // orphans.
@@ -450,22 +620,22 @@ func (mp *txMemPool) FetchTransaction(txHash *wire.ShaHash) (*btcutil.Tx, error)
 	return nil, fmt.Errorf("transaction is not in the pool")
 }
 
-// FilterTransactionsByAddress returns all transactions currently in the
-// mempool that either create an output to the passed address or spend a
-// previously created ouput to the address.
+// FilterTransactionsByAddress returns all transactions currently in the mempool
+// that either create an output to the passed address or spend a previously
+// created ouput to the address.
 func (mp *txMemPool) FilterTransactionsByAddress(addr btcutil.Address) ([]*btcutil.Tx, error) {
 	// Protect concurrent access.
 	mp.RLock()
 	defer mp.RUnlock()
 
-	if txs, exists := mp.addrindex[addr.EncodeAddress()]; exists {
-		addressTxs := make([]*btcutil.Tx, 0, len(txs))
-		for txHash := range txs {
+	if txns, exists := mp.addrIndex[addr.EncodeAddress()]; exists {
+		addressTxns := make([]*btcutil.Tx, 0, len(txns))
+		for txHash := range txns {
 			if txD, exists := mp.pool[txHash]; exists {
-				addressTxs = append(addressTxs, txD.Tx)
+				addressTxns = append(addressTxns, txD.Tx)
 			}
 		}
-		return addressTxs, nil
+		return addressTxns, nil
 	}
 
 	return nil, fmt.Errorf("address does not have any transactions in the pool")
@@ -980,13 +1150,21 @@ func (mp *txMemPool) LastUpdated() time.Time {
 
 // newTxMemPool returns a new memory pool for validating and storing standalone
 // transactions until they are mined into a block.
-func newTxMemPool(cfg *mempoolConfig) *txMemPool {
+func newTxMemPool(cfg *mempoolConfig, db database.DB) *txMemPool {
 	memPool := &txMemPool{
 		cfg:           *cfg,
+		db:            db,
 		pool:          make(map[wire.ShaHash]*mempoolTxDesc),
 		orphans:       make(map[wire.ShaHash]*btcutil.Tx),
 		orphansByPrev: make(map[wire.ShaHash]map[wire.ShaHash]*btcutil.Tx),
 		outpoints:     make(map[wire.OutPoint]*btcutil.Tx),
 	}
+
+	// Create fields related to the address index if needed.
+	if cfg.EnableAddrIndex {
+		memPool.addrIndex = make(map[string]map[wire.ShaHash]struct{})
+		memPool.addrsByTx = make(map[wire.ShaHash]map[string]struct{})
+	}
+
 	return memPool
 }

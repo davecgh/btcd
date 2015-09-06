@@ -805,8 +805,17 @@ func (b *BlockChain) BlockHeightByHash(hash *wire.ShaHash) (int32, error) {
 // BlockHashByHeight returns the hash of the block at the given height in the
 // main chain.
 //
-// This function is safe for concurrent access.
-func (b *BlockChain) BlockHashByHeight(blockHeight int32) (*wire.ShaHash, error) {
+// The database transaction parameter can be nil in which case a a new one will
+// be used.
+//
+// This function is safe for concurrent access.  However, keep in mind that
+// database transactions can't be shared across threads.
+func (b *BlockChain) BlockHashByHeight(dbTx database.Tx, blockHeight int32) (*wire.ShaHash, error) {
+	// Use existing database transaction if provided.
+	if dbTx != nil {
+		return dbFetchHashByHeight(dbTx, blockHeight)
+	}
+
 	var hash *wire.ShaHash
 	err := b.db.View(func(dbTx database.Tx) error {
 		var err error
@@ -907,8 +916,17 @@ func (b *BlockChain) HeightRange(startHeight, endHeight int32) ([]wire.ShaHash, 
 // raw transaction bytes.  When there is no entry for the provided hash, nil
 // will be returned for the both the entry and the error.
 //
-// This function is safe for concurrent access.
-func (b *BlockChain) TxBlockRegion(hash *wire.ShaHash) (*database.BlockRegion, error) {
+// The database transaction parameter can be nil in which case a a new one will
+// be used.
+//
+// This function is safe for concurrent access.  However, keep in mind that
+// database transactions can't be shared across threads.
+func (b *BlockChain) TxBlockRegion(dbTx database.Tx, hash *wire.ShaHash) (*database.BlockRegion, error) {
+	// Use existing database transaction if provided.
+	if dbTx != nil {
+		return dbFetchTxIndexEntry(dbTx, hash)
+	}
+
 	var region *database.BlockRegion
 	err := b.db.View(func(dbTx database.Tx) error {
 		var err error

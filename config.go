@@ -44,6 +44,7 @@ const (
 	defaultBlockPrioritySize = 50000
 	defaultGenerate          = false
 	defaultSigCacheMaxSize   = 50000
+	defaultAddrIndex         = false
 )
 
 var (
@@ -125,6 +126,8 @@ type config struct {
 	GetWorkKeys        []string      `long:"getworkkey" description:"DEPRECATED -- Use the --miningaddr option instead"`
 	NoPeerBloomFilters bool          `long:"nopeerbloomfilters" description:"Disable bloom filtering support."`
 	SigCacheMaxSize    uint          `long:"sigcachemaxsize" description:"The maximum number of entries in the signature verification cache."`
+	AddrIndex          bool          `long:"addrindex" description:"Build and maintain a full address index"`
+	DropAddrIndex      bool          `long:"dropaddrindex" description:"Delete the address-based transaction index from the database on start up and exit"`
 	onionlookup        func(string) ([]net.IP, error)
 	lookup             func(string) ([]net.IP, error)
 	oniondial          func(string, string) (net.Conn, error)
@@ -335,6 +338,7 @@ func loadConfig() (*config, []string, error) {
 		SigCacheMaxSize:   defaultSigCacheMaxSize,
 		MaxOrphanTxs:      maxOrphanTransactions,
 		Generate:          defaultGenerate,
+		AddrIndex:         defaultAddrIndex,
 	}
 
 	// Service options which are only added on Windows.
@@ -670,6 +674,16 @@ func loadConfig() (*config, []string, error) {
 	if cfg.Generate && len(cfg.MiningAddrs) == 0 {
 		str := "%s: the generate flag is set, but there are no mining " +
 			"addresses specified "
+		err := fmt.Errorf(str, funcName)
+		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, usageMessage)
+		return nil, nil, err
+	}
+
+	// --addrindex and --dropaddrindex do not mix.
+	if cfg.AddrIndex && cfg.DropAddrIndex {
+		str := "%s: the --addrindex and --dropaddrindex options can't " +
+			"be activated at the same time"
 		err := fmt.Errorf(str, funcName)
 		fmt.Fprintln(os.Stderr, err)
 		fmt.Fprintln(os.Stderr, usageMessage)

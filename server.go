@@ -2380,7 +2380,7 @@ func newServer(listenAddrs []string, db database.DB, chainParams *chaincfg.Param
 		SigCache:             s.sigCache,
 		TimeSource:           s.timeSource,
 	}
-	s.txMemPool = newTxMemPool(&txC)
+	s.txMemPool = newTxMemPool(&txC, db)
 
 	if !cfg.DisableRPC {
 		s.rpcServer, err = newRPCServer(cfg.RPCListeners, &policy, &s)

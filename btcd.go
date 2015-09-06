@@ -81,6 +81,18 @@ func btcdMain(serverChan chan<- *server) error {
 	}
 	defer db.Close()
 
+	// Drop the address index and exit if requested.
+	if cfg.DropAddrIndex {
+		btcdLog.Info("Deleting entire address index")
+		if err := dropAddrIndex(db); err != nil {
+			btcdLog.Errorf("Failed to delete address index: %v",
+				err)
+			return err
+		}
+		btcdLog.Info("Successfully deleted address index")
+		return nil
+	}
+
 	// Ensure the database is sync'd and closed on Ctrl+C.
 	addInterruptHandler(func() {
 		btcdLog.Infof("Gracefully shutting down the database...")

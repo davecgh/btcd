@@ -104,6 +104,9 @@ Application Options:
       --nopeerbloomfilters  Disable bloom filtering support.
       --sigcachemaxsize=    The maximum number of entries in the signature
                             verification cache.
+      --addrindex=          Build and maintain a full address index
+      --dropaddrindex=      Delete the address-based transaction index from the
+                            database on start up and exit
 
 Help Options:
   -h, --help           Show this help message
