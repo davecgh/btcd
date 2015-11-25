@@ -1017,6 +1017,12 @@ func (b *blockManager) handleInvMsg(imsg *invMsg) {
 // important because the block manager controls which blocks are needed and how
 // the fetching should proceed.
 func (b *blockManager) blockHandler() {
+
+	if b.server.addrIndexer != nil {
+		hash, height := b.chainState.Best()
+		b.server.addrIndexer.AddrIndexStartCatchup(hash, height)
+	}
+
 	candidatePeers := list.New()
 out:
 	for {

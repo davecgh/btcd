@@ -3044,7 +3044,7 @@ func handleSearchRawTransactions(s *rpcServer, cmd interface{}, closeChan <-chan
 			Message: "Invalid address or key: " + err.Error(),
 		}
 	}
-	addrHash, err := addrToHash160(addr)
+	addrHash, err := addrToKey(addr)
 	if err != nil {
 		return nil, &btcjson.RPCError{
 			Code:    btcjson.ErrRPCInvalidAddressOrKey,
@@ -3081,8 +3081,8 @@ func handleSearchRawTransactions(s *rpcServer, cmd interface{}, closeChan <-chan
 		// Load the block regions corresponding to the affected
 		// transactions.
 		blockRegions, dbSkipped, err := dbFetchAddrIndexEntries(s.chain,
-			dbTx, addrHash[:], uint32(numToSkip),
-			uint32(numRequested))
+			dbTx, addrHash, uint32(numToSkip),
+			uint32(numRequested), false)
 		if err != nil {
 			return err
 		}
