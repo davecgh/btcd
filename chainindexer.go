@@ -30,6 +30,9 @@ var (
 	// to signal that the address index is not created.
 	errNoAddrIndex = errors.New("Address index does not exist in db")
 
+	// Fake error used to quit workers from inside database transactions.
+	errNeedToQuit = errors.New("Need to quit")
+
 	// addrIndexBucketName is the name of the db bucket used to house the
 	// address index.
 	addrIndexBucketName = []byte("addridx")
@@ -821,33 +824,91 @@ func (a *addrIndexer) indexManager() {
 		return
 	}
 
-	// Check whether we're behind the chain state.
-	if catchup.height > height {
-		adxrLog.Infof("Building up address index from height %v to %v.",
-			height+1, catchup.height)
-
-		for i := height + 1; i <= catchup.height; i++ {
-			// Check for Shutdown
-			select {
-			case <-a.quit:
-				return
-			default:
-				// Do nothing
-			}
-
-			blk, err := a.server.blockManager.chain.BlockByHeight(i)
+	// Wrap catchup inside a db transaction so blocks are not deleted
+	// from under us due to reorganizes.
+	err = a.server.db.View(func(dbTx database.Tx) error {
+		// Recover if the addrindex tip is not on the main chain.
+		// This is extremely unlikely, but can happen if btcd is launched with
+		// addrindex enabled, then with addrindex disabled, and a reorganize
+		// happens that leaves the addrindex tip orphaned.
+		//
+		// Loop until the addrindex tip is a block that
+		// exists in the main chain.
+		for {
+			// Check the current tip exists.
+			exists, err := a.server.blockManager.chain.MainChainHasBlock(dbTx, hash)
 			if err != nil {
-				adxrLog.Errorf("Unable to fetch block at height %v: %v", i, err)
-				a.server.Stop()
-				return
+				return err
 			}
-			quit := a.enqueueJob(blk, false)
+			if exists {
+				break
+			}
+
+			adxrLog.Infof("Removing block %v (height %d) from addrindex because it's not in the main chain.",
+				hash, height)
+
+			// The current tip is orphaned. Remove the block from the addrindex.
+			// We fetch the block bytes straight from db because using
+			// BlockChain.BlockByHash would error since it's not in the main
+			// chain.
+			blockBytes, err := dbTx.FetchBlock(hash)
+			if err != nil {
+				return err
+			}
+
+			// Create the encapsulated block and set the height appropriately.
+			block, err := btcutil.NewBlockFromBytes(blockBytes)
+			if err != nil {
+				return err
+			}
+			block.SetHeight(height)
+
+			// Enqueue the block to be removed.
+			quit := a.enqueueJob(block, true)
 			if quit {
-				return
+				return errNeedToQuit
 			}
-			hash = blk.Sha()
-			height = i
+
+			// Update tip to the previous block.
+			hash = &block.MsgBlock().Header.PrevBlock
+			height--
 		}
+
+		// Check whether we're behind the chain state.
+		if catchup.height > height {
+			adxrLog.Infof("Building up address index from height %v to %v.",
+				height+1, catchup.height)
+
+			for i := height + 1; i <= catchup.height; i++ {
+				// Check for Shutdown
+				select {
+				case <-a.quit:
+					return errNeedToQuit
+				default:
+					// Do nothing
+				}
+
+				blk, err := a.server.blockManager.chain.BlockByHeight(i)
+				if err != nil {
+					return fmt.Errorf("unable to fetch block at height %v: %v", i, err)
+				}
+				quit := a.enqueueJob(blk, false)
+				if quit {
+					return errNeedToQuit
+				}
+				hash = blk.Sha()
+				height = i
+			}
+		}
+		return nil
+	})
+	if err == errNeedToQuit {
+		return
+	}
+	if err != nil {
+		adxrLog.Errorf("Error during catchup: %v", err)
+		a.server.Stop()
+		return
 	}
 
 	adxrLog.Infof("Address indexer has caught up to best height, entering " +

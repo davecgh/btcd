@@ -3102,7 +3102,7 @@ func handleSearchRawTransactions(s *rpcServer, cmd interface{}, closeChan <-chan
 
 		return nil
 	})
-	if err == nil {
+	if err != nil {
 		context := "Failed to load address index entries"
 		return nil, internalRPCError(err.Error(), context)
 	}

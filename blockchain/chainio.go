@@ -852,6 +852,26 @@ func (b *BlockChain) BlockByHash(hash *wire.ShaHash) (*btcutil.Block, error) {
 	return block, err
 }
 
+// MainChainHasBlock returns whether or not the main chain contains the block
+// identified by the provided hash.
+//
+// The database transaction parameter can be nil in which case a a new one will
+// be used.
+//
+// This function is safe for concurrent access.
+func (b *BlockChain) MainChainHasBlock(dbTx database.Tx, hash *wire.ShaHash) (bool, error) {
+	if dbTx != nil {
+		return dbMainChainHasBlock(dbTx, hash), nil
+	}
+
+	var res bool
+	err := b.db.View(func(dbTx database.Tx) error {
+		res = dbMainChainHasBlock(dbTx, hash)
+		return nil
+	})
+	return res, err
+}
+
 // HeightRange returns a range of block hashes for the given start and end
 // heights.  It is inclusive of the start height and exclusive of the end
 // height.  The end height will be limited to the current main chain height.
