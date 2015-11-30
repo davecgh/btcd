@@ -3080,7 +3080,7 @@ func handleSearchRawTransactions(s *rpcServer, cmd interface{}, closeChan <-chan
 	err = s.server.db.View(func(dbTx database.Tx) error {
 		// Load the block regions corresponding to the affected
 		// transactions.
-		blockRegions, dbSkipped, err := dbFetchAddrIndexEntries(s.chain,
+		blockRegions, dbSkipped, err := fetchAddrIndexEntries(s.chain,
 			dbTx, addrHash, uint32(numToSkip),
 			uint32(numRequested), false)
 		if err != nil {

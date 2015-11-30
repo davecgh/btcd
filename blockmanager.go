@@ -1019,8 +1019,8 @@ func (b *blockManager) handleInvMsg(imsg *invMsg) {
 func (b *blockManager) blockHandler() {
 
 	if b.server.addrIndexer != nil {
-		hash, height := b.chainState.Best()
-		b.server.addrIndexer.AddrIndexStartCatchup(hash, height)
+		best := b.chain.BestSnapshot()
+		b.server.addrIndexer.AddrIndexStartCatchup(best.Hash, best.Height)
 	}
 
 	candidatePeers := list.New()

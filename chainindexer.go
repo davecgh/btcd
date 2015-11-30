@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"runtime"
 	"sync"
 	"sync/atomic"
 
@@ -44,13 +45,13 @@ var (
 	// Limit the number of goroutines that concurrently build the index to
 	// catch up based on the number of processor cores.  This help ensure
 	// the system stays reasonably responsive under heavy load.
-	numIndexWorkers = 3
+	numIndexWorkers = runtime.NumCPU()
 )
 
 const (
 	// Maximum number of txs that are stored in level 0 of an address.
 	// Subsequent levels store maximum double of the previous level.
-	firstLevelMaxSize = 16
+	firstLevelMaxSize = 8
 
 	// Size of an address key: 1 byte of address type plus 20 bytes of
 	// hash160
@@ -68,7 +69,7 @@ type levelKey [levelKeySize]byte
 
 // -----------------------------------------------------------------------------
 // The address index maps addresses referenced in the blockchain to a list of
-// all the transactions involving that address. Transactions are stored oredered
+// all the transactions involving that address. Transactions are stored
 // according to order of appearance in the blockchain: first by block height and
 // then by offset inside the block.
 //
@@ -244,7 +245,7 @@ func dbRemoveFromAddrIndexEntry(dbTx database.Tx, key *addrKey, count int) error
 	// Start with level 0, with the initial max size
 	level := uint8(0)
 
-	// Loop over levels until we hpave no more entries to remove.
+	// Loop over levels until we have no more entries to remove.
 	for count > 0 {
 		// Get the level key for the current level.
 		levelKey := addrKeyToLevelKey(key, level)
@@ -266,10 +267,21 @@ func dbRemoveFromAddrIndexEntry(dbTx database.Tx, key *addrKey, count int) error
 	return nil
 }
 
+// BlockRegion specifies a particular region of a block identified by the
+// specified hash, given an offset and length.
+type addrIndexResult struct {
+	Height int32
+	Offset uint32
+	Len    uint32
+}
+
 // Returns block regions for all referenced transactions and the number of
 // entries skipped since it could have been less in the case there are less
 // total entries than the requested number of entries to skip.
-func dbFetchAddrIndexEntries(chain *blockchain.BlockChain, dbTx database.Tx, key *addrKey, numToSkip, numRequested uint32, reverse bool) ([]database.BlockRegion, uint32, error) {
+// This function returns block heights instead of hashes to avoid a dependency
+// on BlockChain. See fetchAddrIndexEntries below for a version that
+// returns block hashes.
+func dbFetchAddrIndexEntries(dbTx database.Tx, key *addrKey, numToSkip, numRequested uint32, reverse bool) ([]addrIndexResult, uint32, error) {
 	// Load the record from the database and return now if it doesn't exist.
 	addrIndex := dbTx.Metadata().Bucket(addrIndexBucketName)
 	if addrIndex == nil {
@@ -278,7 +290,7 @@ func dbFetchAddrIndexEntries(chain *blockchain.BlockChain, dbTx database.Tx, key
 
 	// Load all
 	level := uint8(0)
-	serializedData := []byte{}
+	var serializedData []byte
 
 	// If reverse is false, we need to fetch all the levels because numToSkip
 	// and numRequested are counted from oldest transactions (highest level),
@@ -318,7 +330,7 @@ func dbFetchAddrIndexEntries(chain *blockchain.BlockChain, dbTx database.Tx, key
 
 	// Start the offset after all skipped entries and load the calculated
 	// number.
-	results := make([]database.BlockRegion, numToLoad)
+	results := make([]addrIndexResult, numToLoad)
 	for i := uint32(0); i < numToLoad; i++ {
 		var offset uint32
 		// Calculate the offset we need to read from, according to the
@@ -328,20 +340,11 @@ func dbFetchAddrIndexEntries(chain *blockchain.BlockChain, dbTx database.Tx, key
 		} else {
 			offset = (numToSkip + i) * txEntrySize
 		}
-		// Deserialize the block height that contains the tx.
-		blockHeight := int32(byteOrder.Uint32(serializedData[offset:]))
-		offset += 4
 
-		// Fetch the hash associated with the height.
-		blockHash, err := chain.BlockHashByHeight(dbTx, blockHeight)
-		if err != nil {
-			return nil, 0, err
-		}
-
-		// Deserialize the transaction offset and length and populate
-		// result.
+		// Deserialize and populate the result.
 		result := &results[i]
-		result.Hash = blockHash
+		result.Height = int32(byteOrder.Uint32(serializedData[offset:]))
+		offset += 4
 		result.Offset = byteOrder.Uint32(serializedData[offset:])
 		offset += 4
 		result.Len = byteOrder.Uint32(serializedData[offset:])
@@ -349,6 +352,29 @@ func dbFetchAddrIndexEntries(chain *blockchain.BlockChain, dbTx database.Tx, key
 	}
 
 	return results, numToSkip, nil
+}
+
+// Returns block regions for all referenced transactions and the number of
+// entries skipped since it could have been less in the case there are less
+// total entries than the requested number of entries to skip.
+func fetchAddrIndexEntries(chain *blockchain.BlockChain, dbTx database.Tx, key *addrKey, numToSkip, numRequested uint32, reverse bool) ([]database.BlockRegion, uint32, error) {
+	res, skipped, err := dbFetchAddrIndexEntries(dbTx, key, numToSkip, numRequested, reverse)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	regions := make([]database.BlockRegion, len(res))
+	for i := 0; i < len(res); i++ {
+		// Fetch the hash associated with the height.
+		regions[i].Hash, err = chain.BlockHashByHeight(dbTx, res[i].Height)
+		if err != nil {
+			return nil, 0, err
+		}
+		regions[i].Len = res[i].Len
+		regions[i].Offset = res[i].Offset
+	}
+
+	return regions, skipped, nil
 }
 
 // dbFetchAddrIndexTip uses an existing database tx to fetch the hash and block
@@ -364,19 +390,19 @@ func dbFetchAddrIndexTip(dbTx database.Tx) (*wire.ShaHash, int32, error) {
 
 	data := addrIndex.Get(addrIndexTipKey)
 
-	sha, err := wire.NewShaHash(data[:wire.HashSize])
+	hash, err := wire.NewShaHash(data[:wire.HashSize])
 	if err != nil {
 		return nil, 0, err
 	}
 	height := int32(byteOrder.Uint32(data[wire.HashSize:]))
 
-	return sha, height, nil
+	return hash, height, nil
 }
 
 // dbUpdateAddrIndexTip uses an existing database tx to update the hash and block
 // height of the most recent block which has had its address index populated.
 // It will return errNoAddrIndex if the address index does not exist.
-func dbUpdateAddrIndexTip(dbTx database.Tx, sha *wire.ShaHash, height int32) error {
+func dbUpdateAddrIndexTip(dbTx database.Tx, hash *wire.ShaHash, height int32) error {
 	// Find the addrindex bucket and fail if it doesn't exist.
 	addrIndex := dbTx.Metadata().Bucket(addrIndexBucketName)
 	if addrIndex == nil {
@@ -384,7 +410,7 @@ func dbUpdateAddrIndexTip(dbTx database.Tx, sha *wire.ShaHash, height int32) err
 	}
 
 	data := make([]byte, wire.HashSize+4)
-	copy(data, sha.Bytes())
+	copy(data, hash[:])
 	byteOrder.PutUint32(data[wire.HashSize:], uint32(height))
 
 	addrIndex.Put(addrIndexTipKey, data)
@@ -394,10 +420,10 @@ func dbUpdateAddrIndexTip(dbTx database.Tx, sha *wire.ShaHash, height int32) err
 // writeIndexData represents the address index data to be written from one block
 type writeIndexData map[addrKey][]*wire.TxLoc
 
-// writeAddrIndexDataForBlock uses an existing database transaction to write
+// appendAddrIndexDataForBlock uses an existing database transaction to write
 // the addrindex data from one block to the database. The addrindex tip before
 // calling this function should be the block previous to the one being written.
-func (a *addrIndexer) writeAddrIndexDataForBlock(dbTx database.Tx, blk *btcutil.Block, data writeIndexData) error {
+func appendAddrIndexDataForBlock(dbTx database.Tx, blk *btcutil.Block, data writeIndexData) error {
 	// Find the addrindex bucket and fail if it doesn't exist.
 	addrIndex := dbTx.Metadata().Bucket(addrIndexBucketName)
 	if addrIndex == nil {
@@ -418,11 +444,11 @@ func (a *addrIndexer) writeAddrIndexDataForBlock(dbTx database.Tx, blk *btcutil.
 	return nil
 }
 
-// eraseAddrIndexDataForBlock uses an existing database transaction to erase
+// removeAddrIndexDataForBlock uses an existing database transaction to erase
 // the addrindex data from one block to the database. The addrindex tip before
 // calling this function should be the block being erased, after the function
 // finishes the tip will be the block before.
-func (a *addrIndexer) eraseAddrIndexDataForBlock(dbTx database.Tx, blk *btcutil.Block, data writeIndexData) error {
+func removeAddrIndexDataForBlock(dbTx database.Tx, blk *btcutil.Block, data writeIndexData) error {
 	// Find the addrindex bucket and fail if it doesn't exist.
 	addrIndex := dbTx.Metadata().Bucket(addrIndexBucketName)
 	if addrIndex == nil {
@@ -458,7 +484,7 @@ func dbCreateAddrIndex(db database.DB, genesisHash *wire.ShaHash) error {
 	return err
 }
 
-// dropAddrIndex removes the entire address index.
+// dbDropAddrIndex removes the entire address index.
 func dbDropAddrIndex(db database.DB) error {
 	err := db.Update(func(dbTx database.Tx) error {
 		return dbTx.Metadata().DeleteBucket(addrIndexBucketName)
@@ -545,22 +571,26 @@ func (a *addrIndexer) indexBlockAddrs(blk *btcutil.Block) (writeIndexData, error
 	return addrIndex, nil
 }
 
-// TODO(davec): Add the code to do the actual indexing.
-// Should have following properties:
-// - When btcd starts, check if the indexer is caught up.
-//   - When it's not:
-//     - Hold off getting any new blocks until it is (this option seems better)
-//       *or*
-//     - Wait until the chain is fully synced before catching up
-//   - When it is:
-//     - Do the indexing when a block is connected
+// -----------------------------------------------------------------------------
+// The addrindexer is a set of workers that are in charge of adding and removing
+// blocks from the address index.
+// The address index stores its own tip. At any moment of time, the tip
+// reflects the highest block that has been indexed. It is updated atomically
+// in a transaction together with the indexed data.
+// There are three types of workers involved:
+// - indexWorker: Takes jobs, processes blocks to extract the index data
+//                in form of a map of address -> txs.
+// - writeWorker: Takes jobs, waits for an indexWorker to finish indexing
+//                the block, and then writes it to the database.
+// - indexManager: generates the jobs that are consumed by the workers.
 //
-// - Use multiple goroutines (numCatchUpWorkers) for extracting the addresses
-//   and push data, etc...
-//   - Likely a function -- IndexBlock(block *btcutil.Block)
-
-// addrIndexer provides a concurrent service for indexing the transactions of
-// target blocks based on the addresses involved in the transaction.
+// It is critical the jobs are written to the database in the correct order.
+// Otherwise, there could be "holes" in the index and the txs could be indexed
+// out of order. To ensure this, there are two job queues (indexJobs and
+// writeJobs). Every job is enqueued in both. Each job has its own result chan,
+// and writeWorker processes jobs serially, waiting if necessary, so blocks
+// are indexed in the correct order even if the indexWorkers finish indexing
+// them out-of-order.
 type addrIndexer struct {
 	server         *server
 	started        int32
@@ -582,7 +612,10 @@ type addrIndexCatchupJob struct {
 	height int32
 }
 
-// indexBlockMsg packages a request to have the addresses of a block indexed.
+// addrIndexJob represents a job to append or remove a block to the addrindex.
+// The 'block' field is the block, the 'remove' field is true if the block
+// should be removed. The 'data' channel is used to pass the indexing result
+// from the index workers to the write worker.
 type addrIndexJob struct {
 	blk    *btcutil.Block
 	remove bool
@@ -650,7 +683,8 @@ func (a *addrIndexer) Stop() error {
 func (a *addrIndexer) IsCaughtUp() bool {
 	a.Lock()
 	defer a.Unlock()
-	return true //a.state == indexStateMaintain
+	//TODO(dirbaio): Implement this
+	return true
 }
 
 // indexWorker indexes the transactions of previously validated and stored
@@ -658,7 +692,11 @@ func (a *addrIndexer) IsCaughtUp() bool {
 // queue.
 // NOTE: Must be run as a goroutine
 func (a *addrIndexer) indexWorker() {
-	defer a.wg.Done()
+	defer func() {
+		a.wg.Done()
+		adxrLog.Trace("Address index worker done")
+	}()
+
 	for {
 		select {
 		case indexJob := <-a.indexJobs:
@@ -685,7 +723,11 @@ func (a *addrIndexer) indexWorker() {
 // index workers to the database.
 // NOTE: Must be run as a goroutine
 func (a *addrIndexer) writeWorker() {
-	defer a.wg.Done()
+	defer func() {
+		a.wg.Done()
+		adxrLog.Trace("Address index write worker done")
+	}()
+
 	for {
 		select {
 		case job := <-a.writeJobs:
@@ -696,8 +738,11 @@ func (a *addrIndexer) writeWorker() {
 			case <-a.quit:
 				return
 			}
-			err := a.server.db.Update(func(tx database.Tx) error {
-				return a.writeAddrIndexDataForBlock(tx, job.blk, data)
+			err := a.server.db.Update(func(dbTx database.Tx) error {
+				if job.remove {
+					return removeAddrIndexDataForBlock(dbTx, job.blk, data)
+				}
+				return appendAddrIndexDataForBlock(dbTx, job.blk, data)
 			})
 			if err != nil {
 				adxrLog.Errorf("Unable to write addr index for "+
@@ -724,7 +769,7 @@ func (a *addrIndexer) enqueueJob(block *btcutil.Block, remove bool) bool {
 
 	// Enqueue it in both queues.
 	// We need to check for quit signal to avoid deadlocks where the workers
-	// have already quitted and the channels are full.
+	// have already quit and the channels are full.
 	select {
 	case a.indexJobs <- job:
 		// Do nothing
@@ -746,14 +791,17 @@ func (a *addrIndexer) enqueueJob(block *btcutil.Block, remove bool) bool {
 // towards the chain tip.
 // NOTE: Must be run as a goroutine.
 func (a *addrIndexer) indexManager() {
-	defer a.wg.Done()
+	defer func() {
+		a.wg.Done()
+		adxrLog.Trace("Address index manager done")
+	}()
 
 	// Read the current addr index tip.
 	var hash *wire.ShaHash
 	var height int32
-	err := a.server.db.View(func(tx database.Tx) error {
+	err := a.server.db.View(func(dbTx database.Tx) error {
 		var err error
-		hash, height, err = dbFetchAddrIndexTip(tx)
+		hash, height, err = dbFetchAddrIndexTip(dbTx)
 		return err
 	})
 	if err != nil {
