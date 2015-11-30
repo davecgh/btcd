@@ -84,7 +84,7 @@ func btcdMain(serverChan chan<- *server) error {
 	// Drop the address index and exit if requested.
 	if cfg.DropAddrIndex {
 		btcdLog.Info("Deleting entire address index")
-		if err := dropAddrIndex(db); err != nil {
+		if err := dbDropAddrIndex(db); err != nil {
 			btcdLog.Errorf("Failed to delete address index: %v",
 				err)
 			return err

@@ -181,6 +181,7 @@ type server struct {
 	txMemPool            *txMemPool
 	cpuMiner             *CPUMiner
 	relayNtfnChan        chan *btcutil.Tx
+	addrIndexer          *addrIndexer
 	modifyRebroadcastInv chan interface{}
 	pendingPeers         chan *serverPeer
 	newPeers             chan *serverPeer
@@ -1584,6 +1585,9 @@ func (s *server) peerHandler() {
 	// in this handler.
 	s.addrManager.Start()
 	s.blockManager.Start()
+	if cfg.AddrIndex {
+		s.addrIndexer.Start()
+	}
 
 	srvrLog.Tracef("Starting peer handler")
 
@@ -1739,6 +1743,9 @@ out:
 		}
 	}
 
+	if cfg.AddrIndex {
+		s.addrIndexer.Stop()
+	}
 	s.blockManager.Stop()
 	s.addrManager.Stop()
 	s.wg.Done()
@@ -2381,6 +2388,14 @@ func newServer(listenAddrs []string, db database.DB, chainParams *chaincfg.Param
 		TimeSource:           s.timeSource,
 	}
 	s.txMemPool = newTxMemPool(&txC, db)
+
+	if cfg.AddrIndex {
+		ai, err := newAddrIndexer(&s)
+		if err != nil {
+			return nil, err
+		}
+		s.addrIndexer = ai
+	}
 
 	if !cfg.DisableRPC {
 		s.rpcServer, err = newRPCServer(cfg.RPCListeners, &policy, &s)
