@@ -10,9 +10,11 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 	"os"
+	"path/filepath"
 	"runtime"
 	"runtime/debug"
 	"runtime/pprof"
+	"time"
 
 	"github.com/decred/dcrd/blockchain/v2/indexers"
 	"github.com/decred/dcrd/internal/limits"
@@ -99,6 +101,53 @@ func dcrdMain() error {
 		defer f.Close()
 		defer pprof.WriteHeapProfile(f)
 	}
+
+	// Dump memory profile after an initial one hour timeout and then twice per
+	// day.
+	go func() {
+		writeHeap := func() {
+			profPath := filepath.Join(cfg.DataDir, "memprofiles")
+			if err := os.MkdirAll(profPath, 0755); err != nil {
+				dcrdLog.Warnf("Failed to create mem profile path %q", profPath)
+				return
+			}
+
+			timestamp := time.Now().Format("2006-01-02-15-04-05")
+			fileName := fmt.Sprintf("memprofile-%s", timestamp)
+			filePath := filepath.Join(profPath, fileName)
+			f, err := os.Create(filePath)
+			if err != nil {
+				dcrdLog.Warnf("Failed to create mem profile %q", filePath)
+				return
+			}
+
+			pprof.WriteHeapProfile(f)
+		}
+
+		initialTimer := time.After(time.Hour)
+		var ticker *time.Ticker
+		defer func() {
+			if ticker != nil {
+				ticker.Stop()
+			}
+		}()
+		var tickerC <-chan time.Time
+		for {
+			select {
+			case <-initialTimer:
+				writeHeap()
+				initialTimer = nil
+				ticker = time.NewTicker(time.Hour * 12)
+				tickerC = ticker.C
+
+			case <-tickerC:
+				writeHeap()
+
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 
 	var lifetimeNotifier lifetimeEventServer
 	if cfg.LifetimeEvents {
