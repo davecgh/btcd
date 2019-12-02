@@ -26,7 +26,6 @@ import (
 	"github.com/decred/dcrd/blockchain/v2"
 	"github.com/decred/dcrd/chaincfg/chainhash"
 	"github.com/decred/dcrd/chaincfg/v2"
-	"github.com/decred/dcrd/crypto/ripemd160"
 	"github.com/decred/dcrd/dcrjson/v3"
 	"github.com/decred/dcrd/dcrutil/v2"
 	"github.com/decred/dcrd/rpc/jsonrpc/types/v2"
@@ -356,10 +355,12 @@ type wsClientFilter struct {
 	params dcrutil.AddressParams
 
 	// Implemented fast paths for address lookup.
-	pubKeyHashes        map[[ripemd160.Size]byte]struct{}
-	scriptHashes        map[[ripemd160.Size]byte]struct{}
-	compressedPubKeys   map[[33]byte]struct{}
-	uncompressedPubKeys map[[65]byte]struct{}
+	// Keys are string type but the values are the raw hash160 bytes
+	// or serialized pubkey bytes, not encoded addresses.
+	pubKeyHashes        map[string]struct{}
+	scriptHashes        map[string]struct{}
+	compressedPubKeys   map[string]struct{}
+	uncompressedPubKeys map[string]struct{}
 
 	// A fallback address lookup map in case a fast path doesn't exist.
 	// Only exists for completeness.  If using this shows up in a profile,
@@ -373,10 +374,10 @@ type wsClientFilter struct {
 func makeWSClientFilter(addresses []string, unspentOutPoints []*wire.OutPoint, params dcrutil.AddressParams) *wsClientFilter {
 	filter := &wsClientFilter{
 		params:              params,
-		pubKeyHashes:        map[[ripemd160.Size]byte]struct{}{},
-		scriptHashes:        map[[ripemd160.Size]byte]struct{}{},
-		compressedPubKeys:   map[[33]byte]struct{}{},
-		uncompressedPubKeys: map[[65]byte]struct{}{},
+		pubKeyHashes:        map[string]struct{}{},
+		scriptHashes:        map[string]struct{}{},
+		compressedPubKeys:   map[string]struct{}{},
+		uncompressedPubKeys: map[string]struct{}{},
 		otherAddresses:      map[string]struct{}{},
 		unspent:             make(map[wire.OutPoint]struct{}, len(unspentOutPoints)),
 	}
@@ -394,23 +395,19 @@ func makeWSClientFilter(addresses []string, unspentOutPoints []*wire.OutPoint, p
 func (f *wsClientFilter) addAddress(a dcrutil.Address) {
 	switch a := a.(type) {
 	case *dcrutil.AddressPubKeyHash:
-		f.pubKeyHashes[*a.Hash160()] = struct{}{}
+		f.pubKeyHashes[string(a.Hash160()[:])] = struct{}{}
 		return
 	case *dcrutil.AddressScriptHash:
-		f.scriptHashes[*a.Hash160()] = struct{}{}
+		f.scriptHashes[string(a.Hash160()[:])] = struct{}{}
 		return
 	case *dcrutil.AddressSecpPubKey:
 		serializedPubKey := a.ScriptAddress()
 		switch len(serializedPubKey) {
 		case 33: // compressed
-			var compressedPubKey [33]byte
-			copy(compressedPubKey[:], serializedPubKey)
-			f.compressedPubKeys[compressedPubKey] = struct{}{}
+			f.compressedPubKeys[string(serializedPubKey)] = struct{}{}
 			return
 		case 65: // uncompressed
-			var uncompressedPubKey [65]byte
-			copy(uncompressedPubKey[:], serializedPubKey)
-			f.uncompressedPubKeys[uncompressedPubKey] = struct{}{}
+			f.uncompressedPubKeys[string(serializedPubKey)] = struct{}{}
 			return
 		}
 	}
@@ -432,28 +429,24 @@ func (f *wsClientFilter) addAddressStr(s string) {
 func (f *wsClientFilter) existsAddress(a dcrutil.Address) bool {
 	switch a := a.(type) {
 	case *dcrutil.AddressPubKeyHash:
-		_, ok := f.pubKeyHashes[*a.Hash160()]
+		_, ok := f.pubKeyHashes[string(a.Hash160()[:])]
 		return ok
 	case *dcrutil.AddressScriptHash:
-		_, ok := f.scriptHashes[*a.Hash160()]
+		_, ok := f.scriptHashes[string(a.Hash160()[:])]
 		return ok
 	case *dcrutil.AddressSecpPubKey:
 		serializedPubKey := a.ScriptAddress()
 		switch len(serializedPubKey) {
 		case 33: // compressed
-			var compressedPubKey [33]byte
-			copy(compressedPubKey[:], serializedPubKey)
-			_, ok := f.compressedPubKeys[compressedPubKey]
+			_, ok := f.compressedPubKeys[string(serializedPubKey)]
 			if !ok {
-				_, ok = f.pubKeyHashes[*a.AddressPubKeyHash().Hash160()]
+				_, ok = f.pubKeyHashes[string(a.AddressPubKeyHash().Hash160()[:])]
 			}
 			return ok
 		case 65: // uncompressed
-			var uncompressedPubKey [65]byte
-			copy(uncompressedPubKey[:], serializedPubKey)
-			_, ok := f.uncompressedPubKeys[uncompressedPubKey]
+			_, ok := f.uncompressedPubKeys[string(serializedPubKey)]
 			if !ok {
-				_, ok = f.pubKeyHashes[*a.AddressPubKeyHash().Hash160()]
+				_, ok = f.pubKeyHashes[string(a.AddressPubKeyHash().Hash160()[:])]
 			}
 			return ok
 		}
